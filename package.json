@@ -21,6 +21,7 @@
         "onCommand:spin.addToTerminalPath",
         "onCommand:spin.deploy",
         "onCommand:fermyon.startLocal",
+        "onCommand:fermyon.stopLocal",
         "onTaskType:spin"
     ],
     "main": "./dist/extension.js",
@@ -40,6 +41,11 @@
                 "category": "Fermyon",
                 "command": "fermyon.startLocal",
                 "title": "Start Local Instance"
+            },
+            {
+                "category": "Fermyon",
+                "command": "fermyon.stopLocal",
+                "title": "Stop Local Instance"
             }
         ],
         "configuration": {

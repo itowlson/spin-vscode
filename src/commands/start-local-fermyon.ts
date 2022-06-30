@@ -7,6 +7,7 @@ import { ensureSpinInstalled } from '../installer';
 import { shell } from '../utils/shell';
 import { ChildProcess, spawn } from 'child_process';
 import { sleep } from '../utils/sleep';
+import { longRunning } from '../longrunning';
 
 let ACTIVE_INSTANCE: LocalInstance | null = null;
 
@@ -26,10 +27,16 @@ export async function startLocalFermyon() {
         vscode.window.showErrorMessage(`Spin is not available: {}`, spinPath.message);
         return;
     }
+    process.env["Spin__BinaryPath"] = spinPath.value;
 
     const prereqsCheck = await checkPrerequisites();
     if (isErr(prereqsCheck)) {
         vscode.window.showErrorMessage(prereqsCheck.message);
+        return;
+    }
+
+    const pw = await vscode.window.showInputBox({prompt: 'sudo password'});
+    if (!pw) {
         return;
     }
 
@@ -41,17 +48,49 @@ export async function startLocalFermyon() {
     // We're going to need
     // * The installer repo
     //   - better to recapitulate the setup script in TS rather than shelling to bash?
-    const consulProcess = spawn('consul', ["agent", "-dev", "-config-file", `${localInstallerPath}/etc/consul.hcl`, '-bootstrap-expect', '1']);
-    instance.setConsul(consulProcess);
-    const nomadProcess = spawn('nomad', ["agent", "-dev", "-config", `${localInstallerPath}/etc/nomad.hcl`, '-data-dir', `${dataDir}/data/nomad`, '-consul-address', '127.0.0.1:8500']);
-    instance.setNomad(nomadProcess);
-    await nomadReady();
+    await longRunning("Starting Consul and Nomad", async () => {
+        // SUDOING CONSUL CAUSES WEIRD ERRORS AND I DON'T KNOW WHY
+        // const consulProcess = spawn('sudo', ['-S', '--preserve-env=PATH,Spin__BinaryPath', 'consul', "agent", "-dev", "-config-file", `${localInstallerPath}/etc/consul.hcl`, '-data-dir', `${dataDir}/data/consul`, '-bootstrap-expect', '1']);
+        // consulProcess.stderr.on('data', () =>
+        //     consulProcess.stdin.write(pw + '\n')
+        // );
+        const consulProcess = spawn('consul', ["agent", "-dev", "-config-file", `${localInstallerPath}/etc/consul.hcl`, '-data-dir', `${dataDir}/data/consul`, '-bootstrap-expect', '1']);
+        instance.setConsul(consulProcess);
 
-    const traefiksr = await shell.exec(`nomad run ${localInstallerPath}/job/traefik.nomad`);
-    if (isErr(traefiksr) || traefiksr.value.code !== 0) {
+        const nomadProcess = spawn('sudo', ['-S', '--preserve-env=PATH,Spin__BinaryPath', 'nomad', "agent", "-dev", "-config", `${localInstallerPath}/etc/nomad.hcl`, '-data-dir', `${dataDir}/data/nomad`, '-consul-address', '127.0.0.1:8500']);
+        nomadProcess.stderr.on('data', () =>
+            nomadProcess.stdin.write(pw + '\n')
+        );
+        instance.setNomad(nomadProcess);
+        
+        await nomadReady();
+    });
+
+    await vscode.window.showInformationMessage("Consul and Nomad ready");
+
+    // // TODO: would it be better to start the job without the interactive monitor (fire
+    // // and forget style) and poll in VS Code or something?
+    // const traefiksr = await longRunning("Starting Traefik", () =>
+    //     shell.exec(`nomad run ${localInstallerPath}/job/traefik.nomad`)
+    // );
+    // if (isErr(traefiksr) || traefiksr.value.code !== 0) {
+    //     const msg = isErr(traefiksr) ?
+    //         traefiksr.message :
+    //         `Exit ${traefiksr.value.code}: ${traefiksr.value.stderr}`;
+    //     await Promise.all([
+    //         instance.stop(),
+    //         vscode.window.showErrorMessage(`TRAEFIK WOE ${msg}`),
+    //     ]);
+    //     return;
+    // }
+
+    const t = await longRunning("Starting Traefik", () =>
+        runJob('traefik', '', localInstallerPath)
+    );
+    if (isErr(t)) {
         await Promise.all([
-            instance.stop(),
-            vscode.window.showErrorMessage("OH NO TRAEFIK"),
+            // instance.stop(),
+            vscode.window.showErrorMessage(`TRAEFIK WOE ${t.message}`),
         ]);
         return;
     }
@@ -62,27 +101,65 @@ export async function startLocalFermyon() {
     const bindleUrl = 'http://bindle.local.fermyon.link/v1';
     const hippoUrl = 'http://hippo.local.fermyon.link';
 
-    const bindlesr = await shell.exec(`nomad run -var="os=${bindleos}" -var="arch=${arch}" ${localInstallerPath}/job/bindle.nomad`);
-    if (isErr(bindlesr) || bindlesr.value.code !== 0) {
+    const b = await longRunning("Starting Bindle", () =>
+        runJob('bindle', `-var="os=${bindleos}" -var="arch=${arch}"`, localInstallerPath)
+    );
+    if (isErr(b)) {
         await Promise.all([
-            instance.stop(),
-            vscode.window.showErrorMessage("OH NO BINDLE"),
+            // instance.stop(),
+            vscode.window.showErrorMessage(`BINDLE WOE ${b.message}`),
         ]);
         return;
     }
 
-    const hipposr = await shell.exec(`nomad run -var="os=${hippoos}" ${localInstallerPath}/job/hippo.nomad`);
-    if (isErr(hipposr) || hipposr.value.code !== 0) {
+    const h = await longRunning("Starting Hippo", () =>
+        runJob('hippo', `-var="os=${hippoos}"`, localInstallerPath)
+    );
+    if (isErr(h)) {
         await Promise.all([
-            instance.stop(),
-            vscode.window.showErrorMessage("OH NO HIPPO"),
+            // instance.stop(),
+            vscode.window.showErrorMessage(`HIPPO WOE ${h.message}`),
         ]);
         return;
     }
+
+    // const bindlesr = await longRunning("Starting Bindle", () =>
+    //     shell.exec(`nomad run -var="os=${bindleos}" -var="arch=${arch}" ${localInstallerPath}/job/bindle.nomad`)
+    // );
+    // if (isErr(bindlesr) || bindlesr.value.code !== 0) {
+    //     const msg = isErr(bindlesr) ?
+    //         bindlesr.message :
+    //         `Exit ${bindlesr.value.code}: ${bindlesr.value.stderr}`;
+    //     await Promise.all([
+    //         instance.stop(),
+    //         vscode.window.showErrorMessage(`OH NO BINDLE ${msg}`),
+    //     ]);
+    //     return;
+    // }
+    // await vscode.window.showInformationMessage("Bindle ready");
+
+    // const hipposr = await longRunning("Starting Hippo", () =>
+    //     shell.exec(`nomad run -var="os=${hippoos}" ${localInstallerPath}/job/hippo.nomad`)
+    // );
+    // if (isErr(hipposr) || hipposr.value.code !== 0) {
+    //     const msg = isErr(hipposr) ?
+    //         hipposr.message :
+    //         `Exit ${hipposr.value.code}: ${hipposr.value.stderr}`;
+    //     await Promise.all([
+    //         instance.stop(),
+    //         vscode.window.showErrorMessage("OH NO HIPPO"),
+    //     ]);
+    //     return;
+    // }
+    // await vscode.window.showInformationMessage("Hippo ready");
 
     ACTIVE_INSTANCE = instance;
 
-    await hippoReady(hippoUrl);
+    await longRunning("Waiting for Hippo to be ready", () =>
+        hippoReady(hippoUrl)
+    );
+
+    await vscode.window.showInformationMessage("TADA READY");
 
     // * the Hippo CLI to register an account?  Can use browser I guess but then we have faff with getting username and password
     //   - oh wait is there a TS client for Hippo?  NO BUT THERE IS A JS ONE
@@ -95,6 +172,65 @@ export async function startLocalFermyon() {
     // console.log(resp.status);
     // console.log(resp.data);
 
+}
+
+async function runJob(name: string, extras: string, localInstallerPath: string): Promise<Errorable<null>> {
+    const sr = await shell.exec(`nomad run ${extras} -detach ${localInstallerPath}/job/${name}.nomad`);
+    if (isErr(sr)) {
+        return err("Failed to run Nomad");
+    }
+    if (sr.value.code !== 0) {
+        return err(`Failed to schedule job: ${sr.value.stderr}`);
+    }
+
+    let statusFailCount = 0;
+    for (;;) {
+        sleep(1000);
+        const ssr = await shell.exec(`nomad job status ${name}`);
+        if (isErr(ssr) || ssr.value.code !== 0) {
+            ++statusFailCount;
+            if (statusFailCount > 5) {
+                if (isErr(sr)) {
+                    return err("Repeatedly failed to run Nomad to get job status");
+                }
+                if (sr.value.code !== 0) {
+                    return err(`Repeatedly failed to get job status: ${sr.value.stderr}`);
+                }
+            }
+        } else {
+            statusFailCount = 0;
+            if (isHealthy(name, ssr.value.stdout)) {
+                return ok(null);
+            }
+        }
+    }
+}
+
+function isHealthy(name: string, nomadStatusText: string): boolean {
+    const lines = nomadStatusText.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
+    const deployedSection = skipWhile(lines, (line) => line !== "Deployed");
+    const statusLine = deployedSection.find((line) => line.startsWith(name));
+    if (!statusLine) {
+        return false;
+    }
+    const statusBits = statusLine.split(' ').filter((bit) => bit.length > 0);
+    const [_name, _desired, placed, healthy, unhealthy, _progress] = statusBits;
+    return (placed ==='1' && healthy === '1' && unhealthy === '0');
+}
+
+function skipWhile<T>(source: T[], predicate: (arg: T) => boolean): T[] {
+    const index = source.findIndex((s) => !predicate(s));
+    if (index < 0) {
+        return [];
+    }
+    return source.slice(index);
+}
+
+export async function stopLocalFermyon() {
+    if (ACTIVE_INSTANCE) {
+        await ACTIVE_INSTANCE.stop();
+        ACTIVE_INSTANCE = null;
+    }
 }
 
 async function nomadReady(): Promise<void> {
@@ -111,10 +247,15 @@ async function nomadReady(): Promise<void> {
 
 async function hippoReady(hippoUrl: string): Promise<void> {
     for (;;) {
-        const resp = await got(`${hippoUrl}/healthz`);
-        if (resp.body.includes('Healthy')) {
-            return;
+        try {
+            const resp = await got(`${hippoUrl}/healthz`, {});
+            if (resp.body.includes('Healthy')) {
+                return;
+            }
+        } catch {
+            // swallow.  It's probably some silly 404
         }
+
         await sleep(1000);
     }
 }
@@ -177,6 +318,7 @@ class LocalInstance {
     }
 
     async stop() {
+        // This no longer works because the processes are audo
         if (this.nomadProcess && !this.nomadProcess.killed) {
             this.nomadProcess.kill();
         }
